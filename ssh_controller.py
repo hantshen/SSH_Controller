@@ -18,10 +18,11 @@ else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_FILE   = os.path.join(_BASE_DIR, "settings.ini")
-# Known-hosts-format line with the device's actual SSH host key (verified via
-# `ssh -vvv` / `ssh-keyscan` against the real device — it always advertises
-# ecdsa-sha2-nistp256, never RSA; MT425E3.crt was the wrong artifact, an RSA
-# cert unrelated to the SSH host key, and is no longer used).
+# Known-hosts-format line with the device's actual SSH host key, captured via
+# `ssh-keyscan` against the real device. This is our own independent SSH
+# trust anchor — never compared against MT425E3.crt (that's a separate RSA
+# TLS cert, unrelated to the SSH host key; different keypair, different
+# purpose). Device always advertises ecdsa-sha2-nistp256, never RSA.
 HOST_KEY_FILE = os.path.join(_BASE_DIR, "MT425E3_hostkey.pub")
 RECV_BUFFER   = 4096
 MAX_LOG_LINES = 500
@@ -65,10 +66,12 @@ def _load_pinned_host_key():
     return entry.key
 
 
-class _PinnedCertPolicy(paramiko.MissingHostKeyPolicy):
+class _PinnedHostKeyPolicy(paramiko.MissingHostKeyPolicy):
     """Reject TOFU entirely: the server's host key must match the key pinned
-    in MT425E3_hostkey.pub. Any mismatch fails closed — no first-connection
-    trust, no known_hosts file."""
+    in MT425E3_hostkey.pub — our own SSH-specific trust anchor, independent
+    of MT425E3.crt (the TLS cert; different keypair, different purpose).
+    Any mismatch fails closed — no first-connection trust, no known_hosts
+    file."""
 
     def __init__(self, log_cb):
         self._log = log_cb
@@ -79,8 +82,8 @@ class _PinnedCertPolicy(paramiko.MissingHostKeyPolicy):
         if key.get_name() != self._pinned.get_name() or key.get_base64() != self._pinned.get_base64():
             raise paramiko.SSHException(
                 f"Host key for {hostname} ({key.get_name()} {fingerprint}) does NOT match "
-                f"MT425E3.crt — refusing to connect.")
-        self._log(f"Host key for {hostname} verified against MT425E3.crt ({key.get_name()} {fingerprint})")
+                f"the pinned SSH host key — refusing to connect.")
+        self._log(f"Host key for {hostname} verified against pinned SSH host key ({key.get_name()} {fingerprint})")
 
 
 class SSHApp:
@@ -374,7 +377,7 @@ class SSHApp:
             for attempt in range(1, CONNECT_RETRY_ATTEMPTS + 1):
                 client = paramiko.SSHClient()
                 client.set_missing_host_key_policy(
-                    _PinnedCertPolicy(lambda m: self.root.after(0, lambda: self._log(m, "info"))))
+                    _PinnedHostKeyPolicy(lambda m: self.root.after(0, lambda: self._log(m, "info"))))
                 try:
                     client.connect(
                         hostname=ip, port=port, username=username or None, password=password or None,
