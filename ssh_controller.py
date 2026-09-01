@@ -9,7 +9,6 @@ import os
 import sys
 
 import paramiko
-from cryptography import x509
 
 # When frozen by PyInstaller --onefile, use the EXE's directory.
 # When running as script, use the script's directory.
@@ -19,15 +18,19 @@ else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_FILE   = os.path.join(_BASE_DIR, "settings.ini")
-CA_CERT_FILE  = os.path.join(_BASE_DIR, "MT425E3.crt")
+# Known-hosts-format line with the device's actual SSH host key (verified via
+# `ssh -vvv` / `ssh-keyscan` against the real device — it always advertises
+# ecdsa-sha2-nistp256, never RSA; MT425E3.crt was the wrong artifact, an RSA
+# cert unrelated to the SSH host key, and is no longer used).
+HOST_KEY_FILE = os.path.join(_BASE_DIR, "MT425E3_hostkey.pub")
 RECV_BUFFER   = 4096
 MAX_LOG_LINES = 500
 CONNECT_TIMEOUT = 15
-# Device's SSH stack advertises one host-key algo per session, picked
-# unpredictably — RSA (good) or ECDSA (firmware bug, breaks kex). Retry a
-# few times client-side rather than surface a spurious failure to the user.
-HOSTKEY_RETRY_ATTEMPTS = 6
-HOSTKEY_RETRY_DELAY    = 2.0
+# A couple of retries for genuine transient banner errors (device SSH stack
+# still settling right after a prior closed connection) — not for host-key
+# algorithm variance, the device only ever offers ecdsa-sha2-nistp256.
+CONNECT_RETRY_ATTEMPTS = 3
+CONNECT_RETRY_DELAY    = 2.0
 
 # Single source of truth for outgoing device commands — edit here only.
 CMDS = {
@@ -53,18 +56,19 @@ _POLL_ECHOES = tuple(v.upper() for k, v in CMDS.items() if k.startswith("get_"))
 
 
 def _load_pinned_host_key():
-    """Extract the RSA public key baked into MT425E3.crt and wrap it as a
-    paramiko RSAKey — the device presents this same RSA keypair as its SSH
-    host key, so this becomes our fixed trust anchor instead of TOFU."""
-    with open(CA_CERT_FILE, "rb") as f:
-        cert = x509.load_pem_x509_certificate(f.read())
-    return paramiko.RSAKey(key=cert.public_key())
+    """Load the device's real SSH host key (ecdsa-sha2-nistp256) from
+    MT425E3_hostkey.pub — a known_hosts-format line captured directly from
+    the device — and use it as our fixed trust anchor instead of TOFU."""
+    with open(HOST_KEY_FILE, "r") as f:
+        line = f.readline().strip()
+    entry = paramiko.hostkeys.HostKeyEntry.from_line(line)
+    return entry.key
 
 
 class _PinnedCertPolicy(paramiko.MissingHostKeyPolicy):
-    """Reject TOFU entirely: the server's host key must match the RSA public
-    key embedded in MT425E3.crt (our CA). Any mismatch fails closed — no
-    first-connection trust, no known_hosts file."""
+    """Reject TOFU entirely: the server's host key must match the key pinned
+    in MT425E3_hostkey.pub. Any mismatch fails closed — no first-connection
+    trust, no known_hosts file."""
 
     def __init__(self, log_cb):
         self._log = log_cb
@@ -367,7 +371,7 @@ class SSHApp:
 
         try:
             client = None
-            for attempt in range(1, HOSTKEY_RETRY_ATTEMPTS + 1):
+            for attempt in range(1, CONNECT_RETRY_ATTEMPTS + 1):
                 client = paramiko.SSHClient()
                 client.set_missing_host_key_policy(
                     _PinnedCertPolicy(lambda m: self.root.after(0, lambda: self._log(m, "info"))))
@@ -375,29 +379,22 @@ class SSHApp:
                     client.connect(
                         hostname=ip, port=port, username=username or None, password=password or None,
                         timeout=CONNECT_TIMEOUT, allow_agent=False, look_for_keys=False,
-                        banner_timeout=CONNECT_TIMEOUT,
-                        # Device's SSH host key is RSA (matches MT425E3.crt); some
-                        # firmware also advertises a broken ECDSA host key that
-                        # crashes paramiko's signature decode on kex, so force RSA
-                        # as the only host-key algorithm to avoid negotiating it.
-                        disabled_algorithms={"keys": ["ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
-                                                      "ecdsa-sha2-nistp521", "ssh-ed25519", "ssh-dss"]})
+                        banner_timeout=CONNECT_TIMEOUT)
                     break  # connected
                 except paramiko.AuthenticationException:
                     client.close()
                     raise  # wrong credentials — retrying won't help, surface immediately
                 except paramiko.SSHException as e:
-                    # Covers IncompatiblePeer (device offered its broken ECDSA
-                    # host key this round) and the transient "Error reading
-                    # SSH protocol banner" the device's SSH stack throws when
-                    # it's still settling from a just-closed prior attempt.
+                    # Transient "Error reading SSH protocol banner" the device's
+                    # SSH stack throws when it's still settling from a
+                    # just-closed prior attempt.
                     client.close()
-                    if attempt == HOSTKEY_RETRY_ATTEMPTS:
+                    if attempt == CONNECT_RETRY_ATTEMPTS:
                         raise
                     self.root.after(0, lambda a=attempt, err=e: self._log(
-                        f"Connect attempt {a}/{HOSTKEY_RETRY_ATTEMPTS} failed ({err}), retrying...",
+                        f"Connect attempt {a}/{CONNECT_RETRY_ATTEMPTS} failed ({err}), retrying...",
                         "info"))
-                    time.sleep(HOSTKEY_RETRY_DELAY)
+                    time.sleep(CONNECT_RETRY_DELAY)
 
             channel = client.invoke_shell(term="vt100", width=200, height=50)
             channel.settimeout(0.2)
