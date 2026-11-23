@@ -66,6 +66,11 @@ def _load_pinned_host_key():
     return entry.key
 
 
+class HostKeyMismatch(paramiko.SSHException):
+    """Pinned host key mismatch — never retried (retrying can't fix it and the
+    device's single session slot would turn retries into banner errors)."""
+
+
 class _PinnedHostKeyPolicy(paramiko.MissingHostKeyPolicy):
     """Reject TOFU entirely: the server's host key must match the key pinned
     in MT425E3_hostkey.pub — our own SSH-specific trust anchor, independent
@@ -80,7 +85,7 @@ class _PinnedHostKeyPolicy(paramiko.MissingHostKeyPolicy):
     def missing_host_key(self, client, hostname, key):
         fingerprint = key.get_fingerprint().hex(":")
         if key.get_name() != self._pinned.get_name() or key.get_base64() != self._pinned.get_base64():
-            raise paramiko.SSHException(
+            raise HostKeyMismatch(
                 f"Host key for {hostname} ({key.get_name()} {fingerprint}) does NOT match "
                 f"the pinned SSH host key — refusing to connect.")
         self._log(f"Host key for {hostname} verified against pinned SSH host key ({key.get_name()} {fingerprint})")
@@ -292,7 +297,7 @@ class SSHApp:
     # --------------------------------------------------------------- Log --
 
     def _log(self, msg, tag="info"):
-        colors = {"send": "#9CDCFE", "recv": "#CE9178", "info": "#DCDCAA", "error": "#F44747"}
+        colors = {"send": "#9CDCFE", "recv": "#FFFF00", "info": "#DCDCAA", "error": "#F44747"}
         self.log.config(state=tk.NORMAL)
         timestamp = time.strftime("%H:%M:%S")
         self.log.insert(tk.END, f"[{timestamp}] {msg}\n", tag)
@@ -384,9 +389,9 @@ class SSHApp:
                         timeout=CONNECT_TIMEOUT, allow_agent=False, look_for_keys=False,
                         banner_timeout=CONNECT_TIMEOUT)
                     break  # connected
-                except paramiko.AuthenticationException:
+                except (paramiko.AuthenticationException, HostKeyMismatch):
                     client.close()
-                    raise  # wrong credentials — retrying won't help, surface immediately
+                    raise  # wrong credentials / host key — retrying won't help, surface immediately
                 except paramiko.SSHException as e:
                     # Transient "Error reading SSH protocol banner" the device's
                     # SSH stack throws when it's still settling from a
@@ -631,10 +636,18 @@ class SSHApp:
             self._send_cmd(cmd)
             self.custom_cmd.set("")
 
+    # ------------------------------------------------------------ Close --
+
+    def _on_close(self):
+        if self.connected:
+            self._disconnect()
+        self.root.destroy()
+
 
 def main():
     root = tk.Tk()
-    SSHApp(root)
+    app = SSHApp(root)
+    root.protocol("WM_DELETE_WINDOW", app._on_close)
     root.mainloop()
 
 
